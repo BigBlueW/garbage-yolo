@@ -1,3 +1,5 @@
 [submodule "robotic-garbage-obb"]
 	path = robotic-garbage-obb
 	url = https://huggingface.co/datasets/0326BlueW/robotic-garbage-obb
+	ignore = untracked
+
