@@ -1,0 +1,23 @@
+# Environments
+.venv/
+.venv
+__pycache__/
+*.pyc
+
+# IDEs
+.vscode/
+.idea/
+
+# Caches & Temporary
+*.cache
+archive/
+archive.zip
+
+# Model Weights (base checkpoints and intermediate weights)
+yolo*.pt
+last.pt
+
+# Training outputs and test results
+runs/
+test_results/
+garbage_classification_runs/
