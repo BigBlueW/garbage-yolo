@@ -25,6 +25,10 @@ def auto_standardize_filenames(dataset_name):
         all_imgs.extend(glob.glob(os.path.join(images_dir, ext)))
         all_imgs.extend(glob.glob(os.path.join(images_dir, ext.upper())))
 
+    # Windows globbing is case-insensitive, so lower/upper patterns return the
+    # same file twice unless paths are deduplicated.
+    all_imgs = sorted(set(all_imgs))
+
     prefix = dataset_name
     pattern = re.compile(rf"^{prefix}_(\d+)\.(jpg|jpeg|png|webp)$", re.IGNORECASE)
 
@@ -485,7 +489,7 @@ def main():
         for ext in extensions:
             image_paths.extend(glob.glob(os.path.join(images_dir, ext)))
             image_paths.extend(glob.glob(os.path.join(images_dir, ext.upper())))
-        image_paths = sorted(image_paths)
+        image_paths = sorted(set(image_paths))
 
         if not image_paths:
             print(f"⚠️ {dataset_name} 資料夾中沒有找到圖片。按 T 可切換資料夾。")

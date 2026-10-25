@@ -16,8 +16,18 @@ archive.zip
 # Model Weights (base checkpoints and intermediate weights)
 yolo*.pt
 last.pt
+best_incremental_v2.pt
+weights/
 
 # Training outputs and test results
 runs/
 test_results/
 garbage_classification_runs/
+order_runs/
+
+# Local capture, external datasets, and generated dataset variants
+capture_inbox/
+external_data/
+robotic-garbage-obb-detector-v2/
+robotic-garbage-obb-grouped*/
+dataset_detector_v2.yaml

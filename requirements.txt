@@ -3,3 +3,4 @@ customtkinter
 numpy
 opencv-python
 pillow
+pyrealsense2==2.59.1.11053; platform_system == "Windows"
