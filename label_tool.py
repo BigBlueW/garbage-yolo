@@ -19,7 +19,7 @@ def content_hash_name(img_path):
 def auto_standardize_filenames(dataset_name):
     """
     自動掃描 dataset_name (如 train / test) 資料夾。
-    若發現檔名不是「內容雜湊」的新圖片，同步將圖片、txt 標籤、grasp_order json 重命名為 {hash}.ext。
+    若發現檔名不是「內容雜湊」的新圖片，同步將圖片、txt 標籤、grasp_order json 重命名為 {hash}.ext / .txt / .json。
     撞名但內容不同時中止，不覆蓋。
     """
     split_dir = os.path.join(DATASET_ROOT, dataset_name)
@@ -55,13 +55,7 @@ def auto_standardize_filenames(dataset_name):
             os.rename(old_lbl_path, os.path.join(labels_dir, new_base + ".txt"))
         old_order_path = os.path.join(order_dir, name + ".json")
         if os.path.exists(old_order_path):
-            with open(old_order_path, "r", encoding="utf-8") as f:
-                doc = json.load(f)
-            doc["image"] = new_filename
-            with open(os.path.join(order_dir, new_base + ".json"), "w", encoding="utf-8") as f:
-                json.dump(doc, f, ensure_ascii=False, indent=2)
-                f.write("\n")
-            os.remove(old_order_path)
+            os.rename(old_order_path, os.path.join(order_dir, new_base + ".json"))
         renamed += 1
         print(f"  • {old_filename} -> {new_filename}")
 
@@ -158,17 +152,48 @@ boxes = []
 selected_box_idx = -1
 history_stack = []
 
+# 夾取順序：relations 每筆 [上, 下] = boxes 索引，「上」壓在「下」上面、要先夾
+relations = []
+order_mode = False      # Tab 切換；順序模式下框鎖住，只能從上到下點出「誰壓誰」
+chain_head = -1         # 順序模式：目前這一串最後點的框（下一個點的框＝被它壓住）
+last_order_click = None # (x, y, 候選框索引, 第幾個)：同位置連點時在重疊框間輪替
+
 # Interaction Modes: 'IDLE', 'DRAWING_NEW', 'MOVING', 'ROTATING', 'RESIZING_HANDLE'
 interaction_mode = 'IDLE'
 drag_start_pos = (0, 0)
 drag_start_box = None
 active_handle_idx = -1  # 0~3 for corners, 4~7 for edges, 8 for rotation handle
 
+def snapshot():
+    return ([(b.cls_id, b.cx, b.cy, b.w, b.h, b.angle_deg) for b in boxes],
+            [list(r) for r in relations], chain_head)
+
 def push_history():
-    global history_stack
-    history_stack.append([b.copy() for b in boxes])
-    if len(history_stack) > 20:
+    """在改動前呼叫；與上一筆相同就不重複記（點選但沒改動時）。"""
+    snap = snapshot()
+    if history_stack and history_stack[-1] == snap:
+        return
+    history_stack.append(snap)
+    if len(history_stack) > 50:
         history_stack.pop(0)
+
+def undo():
+    global last_order_click
+    while history_stack and history_stack[-1] == snapshot():  # 跳過「點了但沒改」的紀錄
+        history_stack.pop()
+    if not history_stack:
+        print("↩️ 沒有可復原的步驟")
+        return
+    restore(history_stack.pop())
+    last_order_click = None
+    print("↩️ 復原")
+
+def restore(snap):
+    global boxes, relations, chain_head, selected_box_idx
+    box_states, rel, chain_head = snap
+    boxes = [OBBBox(*s) for s in box_states]
+    relations = [list(r) for r in rel]
+    selected_box_idx = -1
 
 def load_labels(txt_path, img_w, img_h):
     loaded = []
@@ -214,6 +239,7 @@ def load_labels(txt_path, img_w, img_h):
     return loaded
 
 def save_labels(txt_path, img_w, img_h):
+    save_relations(order_path_for(txt_path))
     if len(boxes) == 0:
         if os.path.exists(txt_path):
             os.remove(txt_path)
@@ -231,16 +257,121 @@ def save_labels(txt_path, img_w, img_h):
             pts_str = " ".join(norm_pts)
             f.write(f"{b.cls_id} {pts_str}\n")
 
+def order_path_for(txt_path):
+    """<split>/labels/<stem>.txt -> <split>/grasp_order/<stem>.json"""
+    split_dir = os.path.dirname(os.path.dirname(txt_path))
+    stem = os.path.splitext(os.path.basename(txt_path))[0]
+    return os.path.join(split_dir, "grasp_order", stem + ".json")
+
+def load_relations(json_path, num_boxes):
+    if not os.path.exists(json_path):
+        return []
+    with open(json_path, "r", encoding="utf-8") as f:
+        loaded = [list(r) for r in json.load(f)["relations"]]
+    for up, down in loaded:
+        if not (0 <= up < num_boxes and 0 <= down < num_boxes):
+            raise ValueError(f"{json_path} 的關係 [{up}, {down}] 超出框數 {num_boxes}")
+    return loaded
+
+def save_relations(json_path):
+    """沒有任何壓住關係就不留檔。"""
+    if not relations:
+        if os.path.exists(json_path):
+            os.remove(json_path)
+        return
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({"relations": relations}, f)
+        f.write("\n")
+
+def is_above(a, b):
+    """沿著 [上, 下] 關係，a 是否（直接或間接）在 b 上面。"""
+    stack, seen = [a], set()
+    while stack:
+        cur = stack.pop()
+        for up, down in relations:
+            if up == cur and down not in seen:
+                if down == b:
+                    return True
+                seen.add(down)
+                stack.append(down)
+    return False
+
+def toggle_relation(up, down):
+    """已存在就移除；否則在不矛盾（反向／成環）時新增。回傳 'added' / 'removed' / 'rejected'。"""
+    if [up, down] in relations:
+        relations.remove([up, down])
+        print(f"↩️ 移除：#{up} 壓 #{down}")
+        return 'removed'
+    if is_above(down, up):
+        print(f"⚠️ #{down} 已在 #{up} 上面，不能再標 #{up} 壓 #{down}")
+        return 'rejected'
+    relations.append([up, down])
+    print(f"⬇️ #{up} 壓 #{down}")
+    return 'added'
+
+def order_click(i):
+    """順序模式點到框 i：沒有串就從 i 開始；有串就標「串尾壓 i」並把 i 接成新串尾。"""
+    global chain_head
+    if chain_head < 0:
+        chain_head = i
+        return
+    result = toggle_relation(chain_head, i)
+    if result == 'added':
+        chain_head = i
+    elif result == 'removed':
+        chain_head = -1   # 取消箭頭後不續串，避免接著誤標
+
+def order_click_at(x, y):
+    """點擊位置的候選框（上層優先、排除串尾）；同位置連點則復原上一次並換下一個候選。"""
+    global last_order_click
+    if (last_order_click is not None and dist((x, y), last_order_click[:2]) <= 6
+            and len(last_order_click[2]) > 1):
+        _, _, cands, k, before = last_order_click
+        restore(before)
+        k = (k + 1) % len(cands)
+    else:
+        cands = [i for i in range(len(boxes) - 1, -1, -1)
+                 if i != chain_head and boxes[i].contains_point(x, y)]
+        if not cands:
+            return
+        k = 0
+        before = snapshot()
+        push_history()
+    order_click(cands[k])
+    last_order_click = (x, y, cands, k, before)
+
+def graspable_now():
+    """沒有被任何框壓住的框（L1）。"""
+    covered = {d for _, d in relations}
+    return [i for i in range(len(boxes)) if i not in covered]
+
+def delete_box(i):
+    """刪框並同步關係：含此框的關係刪除，之後的索引往前移。"""
+    global relations, chain_head
+    boxes.pop(i)
+    chain_head = -1
+    relations = [[u - (u > i), d - (d > i)] for u, d in relations if i not in (u, d)]
+
 def dist(p1, p2):
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
 def on_mouse(event, x, y, flags, param):
     global interaction_mode, drag_start_pos, drag_start_box, active_handle_idx
-    global selected_box_idx, boxes
+    global selected_box_idx, boxes, chain_head, last_order_click
 
     HANDLE_RADIUS = 10
     # Compensate for 42px header banner offset
     y_adj = y - 42
+
+    # 0. 順序模式：框鎖住；左鍵由上往下點、右鍵結束這一串
+    if order_mode:
+        if event == cv2.EVENT_LBUTTONDOWN and y_adj >= 0:
+            order_click_at(x, y_adj)
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            chain_head = -1
+            last_order_click = None
+        return
 
     # 1. DOUBLE CLICK TO DELETE
     if event == cv2.EVENT_LBUTTONDBLCLK:
@@ -251,7 +382,7 @@ def on_mouse(event, x, y, flags, param):
             if boxes[i].contains_point(x, y_adj):
                 push_history()
                 print(f"🗑️ 雙擊刪除框: {CLASS_NAMES[boxes[i].cls_id]}")
-                boxes.pop(i)
+                delete_box(i)
                 selected_box_idx = -1
                 return
         selected_box_idx = -1
@@ -367,9 +498,22 @@ def on_mouse(event, x, y, flags, param):
         drag_start_box = None
         active_handle_idx = -1
 
+def render_order_boxes(display_img):
+    """順序模式：一般框灰色，現在可夾（L1）亮綠粗框，串尾黃色粗框。"""
+    l1 = set(graspable_now())
+    for i, b in enumerate(boxes):
+        pts_np = np.array(b.get_corners(), dtype=np.int32).reshape((-1, 1, 2))
+        if i == chain_head:
+            color, thick = (0, 255, 255), 4
+        elif i in l1:
+            color, thick = (0, 255, 0), 3
+        else:
+            color, thick = (150, 150, 150), 1
+        cv2.polylines(display_img, [pts_np], isClosed=True, color=color, thickness=thick, lineType=cv2.LINE_AA)
+
 def render_ui(display_img, img_w, img_h, img_idx, total_imgs, filename, dataset_name):
     # 1. Draw All Bounding Boxes
-    for i, b in enumerate(boxes):
+    for i, b in enumerate([] if order_mode else boxes):
         corners = b.get_corners()
         pts_np = np.array(corners, dtype=np.int32).reshape((-1, 1, 2))
         
@@ -424,6 +568,16 @@ def render_ui(display_img, img_w, img_h, img_idx, total_imgs, filename, dataset_
                 cv2.circle(display_img, (epx, epy), 4, (255, 255, 255), -1, cv2.LINE_AA)
                 cv2.circle(display_img, (epx, epy), 4, (0, 0, 0), 1, cv2.LINE_AA)
 
+    if order_mode:
+        render_order_boxes(display_img)
+
+    # 1b. 壓住關係箭頭：上 -> 下（黑底黃線，任何背景都看得到）
+    for up, down in relations:
+        p_up = (int(round(boxes[up].cx)), int(round(boxes[up].cy)))
+        p_down = (int(round(boxes[down].cx)), int(round(boxes[down].cy)))
+        cv2.arrowedLine(display_img, p_up, p_down, (0, 0, 0), 5, cv2.LINE_AA, tipLength=0.15)
+        cv2.arrowedLine(display_img, p_up, p_down, (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.15)
+
     # 2. Top Banner & HUD Information
     header_h = 42
     banner = np.zeros((header_h, img_w, 3), dtype=np.uint8)
@@ -434,12 +588,15 @@ def render_ui(display_img, img_w, img_h, img_idx, total_imgs, filename, dataset_
     cv2.putText(banner, ds_badge, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
     # Selected Box Info / Quick Help
-    if selected_box_idx >= 0 and selected_box_idx < len(boxes):
+    if order_mode:
+        order_info = "[ORDER] Click top -> bottom | Right:End chain | Click same spot:Next overlap | Z:Undo | Tab:Boxes"
+        cv2.putText(banner, order_info, (max(10, img_w - 720), 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
+    elif selected_box_idx >= 0 and selected_box_idx < len(boxes):
         sel_b = boxes[selected_box_idx]
         sel_info = f"Selected: {CLASS_NAMES[sel_b.cls_id]} | Angle: {int(sel_b.angle_deg)}° | [0-3]:Class [ [ / ] ]:Rotate [Del/DblClick]:Remove"
         cv2.putText(banner, sel_info, (max(10, img_w - 750), 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
     else:
-        hint_text = "Drag:Draw New | Click:Select | DblClick:Remove | A:Prev D:Next T:Switch-Dataset Q:Quit"
+        hint_text = "Drag:Draw New | Click:Select | DblClick:Remove | Z:Undo Tab:Order A:Prev D:Next T:Dataset Q:Quit"
         cv2.putText(banner, hint_text, (max(10, img_w - 700), 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1, cv2.LINE_AA)
 
     # Combine Banner and Image
@@ -447,7 +604,8 @@ def render_ui(display_img, img_w, img_h, img_idx, total_imgs, filename, dataset_
     return final_canvas
 
 def main():
-    global current_dataset_idx, boxes, selected_box_idx, history_stack
+    global current_dataset_idx, boxes, selected_box_idx, history_stack, relations
+    global order_mode, chain_head, last_order_click
 
     window_name = "YOLO OBB Smart Annotation & Review Tool"
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
@@ -465,6 +623,10 @@ def main():
     print("  • 空白處拖曳     : 畫出新框")
     print("  • 數字鍵 0~3     : 快速切換選取框的類別 (0:塑膠, 1:金屬, 2:紙類, 3:一般)")
     print("  • 雙擊左鍵 / Del / X: 刪除選取框")
+    print("  • Z 鍵           : 復原（框與順序都可）")
+    print("  • Tab 鍵         : 切換「框模式 / 順序模式」；順序模式下框鎖住：")
+    print("                     由上往下依序點同一疊的框（自動標 上壓下），右鍵結束這一串")
+    print("                     點已有的一組＝取消；同位置連點＝在重疊框間切換；亮綠框＝現在可夾")
     print("  • A / D / Space  : 上一張 / 下一張（自動存檔）")
     print("  • T 鍵           : 切換 train / val / test 資料集")
     print("  • Q / Esc        : 儲存並離開")
@@ -526,6 +688,10 @@ def main():
         
         # Load Labels (Supports both HBB and OBB)
         boxes = load_labels(txt_path, w, h)
+        relations = load_relations(order_path_for(txt_path), len(boxes))
+        order_mode = False
+        chain_head = -1
+        last_order_click = None
         selected_box_idx = -1
         history_stack.clear()
 
@@ -555,11 +721,21 @@ def main():
                             delta = 10.0 if key == ord('}') else -10.0
                         boxes[selected_box_idx].angle_deg = (boxes[selected_box_idx].angle_deg + delta) % 360.0
 
+                elif key == 9:  # Tab：框模式 <-> 順序模式
+                    order_mode = not order_mode
+                    chain_head = -1
+                    last_order_click = None
+                    selected_box_idx = -1
+                    print("🔀 順序模式" if order_mode else "🔲 框模式")
+
+                elif key in [ord('z'), ord('Z')]:
+                    undo()
+
                 elif key in [ord('x'), ord('X'), 8, 127] or raw_key in [65535, 0xFFFF]: # 'x', Backspace, Delete
                     if selected_box_idx >= 0 and selected_box_idx < len(boxes):
                         push_history()
                         print(f"🗑️ 刪除標籤框: {CLASS_NAMES[boxes[selected_box_idx].cls_id]}")
-                        boxes.pop(selected_box_idx)
+                        delete_box(selected_box_idx)
                         selected_box_idx = -1
 
                 elif key in [ord('t'), ord('T')]: # Switch Dataset between train and test
