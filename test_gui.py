@@ -28,8 +28,12 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")
 
 # Config Paths
-MODEL_PATH = "best.pt"
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(REPO_ROOT, "best.pt")
+# --path 先照 cwd 解析，不存在再相對 repo 根（讓從任何目錄啟動都能用）
+if not os.path.isdir(args.path) and os.path.isdir(os.path.join(REPO_ROOT, args.path)):
+    args.path = os.path.join(REPO_ROOT, args.path)
+args.path = os.path.abspath(args.path)
 DEFAULT_DATASET_DIR = os.path.join(REPO_ROOT, "robotic-garbage-obb")
 
 
@@ -372,8 +376,8 @@ class App(ctk.CTk):
             model_to_load = MODEL_PATH
             if not os.path.exists(model_to_load):
                 alt_weights = [
-                    "garbage_classification_runs/yolo11x_obb_model/weights/best.pt",
-                    "yolo11x-obb.pt"
+                    os.path.join(REPO_ROOT, "garbage_classification_runs/yolo11x_obb_model/weights/best.pt"),
+                    os.path.join(REPO_ROOT, "yolo11x-obb.pt"),
                 ]
                 for alt in alt_weights:
                     if os.path.exists(alt):

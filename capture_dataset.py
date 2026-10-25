@@ -8,10 +8,11 @@
   NNNN_color.png         原始 RGB
   NNNN_depth.npy         原始 uint16 mm（零損耗，後續演算用）
   NNNN_depth_jet.png     JET 熱圖預覽（人眼檢查用）
+  NNNN_info.json         camera_info 內參＋拍攝當下手臂 TCP（深度算真實位置／多視角對齊用）
 
 使用（相機已起的狀態下，於 yolo repo 目錄內）。
-注意：要用**系統 python**（.venv 沒灌 rclpy），且必 source ROS：
-  source /opt/ros/humble/setup.bash
+注意：要用**系統 python**（.venv 沒灌 rclpy），且必 source ROS＋workspace（TCP 要 tm_msgs）：
+  source /opt/ros/humble/setup.bash && source <repo>/install/setup.bash
   python3 capture_dataset.py --side left
   # 每次 Enter 拍一張；'q'+Enter 結束；Ctrl-C 也結束
 
@@ -19,6 +20,7 @@
 """
 
 import argparse
+import json
 import os
 import time
 
@@ -26,7 +28,12 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
+
+try:
+    from tm_msgs.msg import FeedbackState
+except ImportError:   # 沒 source workspace install：照樣拍，只是 info.json 的 tcp_pose 為 null
+    FeedbackState = None
 
 
 def color_msg_to_bgr(msg: Image) -> np.ndarray | None:
@@ -67,6 +74,20 @@ def next_index(save_dir: str) -> int:
         if "_color" in stem and prefix.isdigit():
             max_idx = max(max_idx, int(prefix))
     return max_idx + 1
+
+
+def camera_info_to_dict(msg: CameraInfo | None) -> dict | None:
+    if msg is None:
+        return None
+    return {"width": msg.width, "height": msg.height, "frame_id": msg.header.frame_id,
+            "distortion_model": msg.distortion_model,
+            "k": list(msg.k), "d": list(msg.d)}
+
+
+def stamp_sec(msg) -> float | None:
+    if msg is None:
+        return None
+    return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
 
 def wait_for_pair(node: Node, timeout_sec: float) -> tuple[Image | None, Image | None]:
@@ -127,6 +148,23 @@ def main():
         namespace=f"/arm/camera_{args.side}/realsense_camera_{args.side}",
     )
 
+    latest = {"info": None, "tcp": None}
+
+    def on_info(msg: CameraInfo):
+        latest["info"] = msg
+
+    def on_feedback(msg):
+        if len(msg.tool_pose) >= 6:
+            latest["tcp"] = [float(v) for v in msg.tool_pose[:6]]
+
+    node.create_subscription(CameraInfo, "color/camera_info", on_info, 10)
+    if FeedbackState is not None:
+        # TM driver 全域介面（不在相機 namespace 下），故意絕對路徑
+        node.create_subscription(
+            FeedbackState, f"/arm/tm12_{args.side}/tm_driver/feedback_states", on_feedback, 10)
+    else:
+        print("[warn] import tm_msgs 失敗（沒 source install/setup.bash?）：tcp_pose 會存 null")
+
     idx = 0
     print(f"[capture_dataset] side={args.side} save={save_dir}")
     print("Enter=拍一張 (RGB+depth 配對), 'q'+Enter=結束, Ctrl-C=結束")
@@ -136,6 +174,13 @@ def main():
             if user_input.strip().lower() == "q":
                 break
             color_msg, depth_msg = wait_for_pair(node, args.timeout)
+            # 再 spin 一下：讓 camera_info / TCP 收到「此刻」的最新值（wait_for_pair 一收齊影像就返回）
+            start = time.monotonic()
+            while time.monotonic() - start < 1.0:
+                rclpy.spin_once(node, timeout_sec=0.02)
+                if (time.monotonic() - start >= 0.2 and latest["info"] is not None
+                        and (latest["tcp"] is not None or FeedbackState is None)):
+                    break
             bgr = color_msg_to_bgr(color_msg) if color_msg is not None else None
             depth_mm = depth_msg_to_mm(depth_msg) if depth_msg is not None else None
 
@@ -156,6 +201,7 @@ def main():
             color_path = os.path.join(save_dir, f"{prefix}_color.png")
             depth_npy_path = os.path.join(save_dir, f"{prefix}_depth.npy")
             jet_path = os.path.join(save_dir, f"{prefix}_depth_jet.png")
+            info_path = os.path.join(save_dir, f"{prefix}_info.json")
 
             ok, buf = cv2.imencode(".png", bgr)
             if ok:
@@ -164,7 +210,16 @@ def main():
             ok, buf = cv2.imencode(".png", depth_to_jet(depth_mm))
             if ok:
                 buf.tofile(jet_path)
-            print(f"  [saved] {color_path}\n          {depth_npy_path}\n          {jet_path}")
+            info = {"side": args.side,
+                    "stamp_color": stamp_sec(color_msg), "stamp_depth": stamp_sec(depth_msg),
+                    "camera_info": camera_info_to_dict(latest["info"]),
+                    "tcp_pose": latest["tcp"]}   # TM tool_pose：m / rad（x y z rx ry rz），base frame
+            with open(info_path, "w") as f:
+                json.dump(info, f, indent=2)
+            warn = [n for n, v in (("camera_info", info["camera_info"]), ("tcp_pose", info["tcp_pose"]))
+                    if v is None]
+            print(f"  [saved] {color_path}\n          {depth_npy_path}\n          {jet_path}\n          {info_path}"
+                  + (f"\n  [warn] 沒收到 {'+'.join(warn)}，info.json 內為 null" if warn else ""))
     except KeyboardInterrupt:
         pass
     finally:

@@ -1,6 +1,7 @@
 import os
 import glob
-import re
+import hashlib
+import json
 import math
 import numpy as np
 import cv2
@@ -8,14 +9,23 @@ import cv2
 DATASET_ROOT = "robotic-garbage-obb"
 DATASETS = ["train", "val", "test"]
 
+HASH_LEN = 8
+
+def content_hash_name(img_path):
+    """圖片內容 sha256 前 HASH_LEN 碼：同一張圖不管誰匯入、放哪個 split，檔名都一樣。"""
+    with open(img_path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:HASH_LEN]
+
 def auto_standardize_filenames(dataset_name):
     """
     自動掃描 dataset_name (如 train / test) 資料夾。
-    若發現未符合 {prefix}_{idx:03d}.ext 格式的新圖片，
-    會自動接續當前最大編號，同步將圖片與對應 txt 標籤重命名為標準格式。
+    若發現檔名不是「內容雜湊」的新圖片，同步將圖片、txt 標籤、grasp_order json 重命名為 {hash}.ext。
+    撞名但內容不同時中止，不覆蓋。
     """
-    images_dir = os.path.join(DATASET_ROOT, dataset_name, "images")
-    labels_dir = os.path.join(DATASET_ROOT, dataset_name, "labels")
+    split_dir = os.path.join(DATASET_ROOT, dataset_name)
+    images_dir = os.path.join(split_dir, "images")
+    labels_dir = os.path.join(split_dir, "labels")
+    order_dir = os.path.join(split_dir, "grasp_order")
     if not os.path.exists(images_dir):
         return
 
@@ -25,45 +35,38 @@ def auto_standardize_filenames(dataset_name):
         all_imgs.extend(glob.glob(os.path.join(images_dir, ext)))
         all_imgs.extend(glob.glob(os.path.join(images_dir, ext.upper())))
 
-    prefix = dataset_name
-    pattern = re.compile(rf"^{prefix}_(\d+)\.(jpg|jpeg|png|webp)$", re.IGNORECASE)
-
-    standard_indices = []
-    non_standard_files = []
-
-    for img_path in all_imgs:
-        filename = os.path.basename(img_path)
-        match = pattern.match(filename)
-        if match:
-            standard_indices.append(int(match.group(1)))
-        else:
-            non_standard_files.append(img_path)
-
-    if not non_standard_files:
-        return
-
-    max_idx = max(standard_indices) if standard_indices else 0
-    non_standard_files = sorted(non_standard_files)
-
-    print(f"\n✨ 自動偵測到 {len(non_standard_files)} 張新加入的圖片，正在自動標準化檔名編號...")
-    for old_img_path in non_standard_files:
-        max_idx += 1
+    renamed = 0
+    for old_img_path in sorted(set(all_imgs)):
         old_filename = os.path.basename(old_img_path)
         name, ext = os.path.splitext(old_filename)
-        ext = ext.lower()
+        new_base = content_hash_name(old_img_path)
+        if name == new_base:
+            continue
+        new_filename = new_base + ext.lower()
+        new_img_path = os.path.join(images_dir, new_filename)
+        if os.path.exists(new_img_path):
+            raise RuntimeError(f"{old_filename} 與既有的 {new_filename} 同名（重複圖片或雜湊碰撞），請手動處理")
 
-        new_base = f"{prefix}_{max_idx:03d}"
-        new_img_path = os.path.join(images_dir, f"{new_base}{ext}")
-        old_lbl_path = os.path.join(labels_dir, name + ".txt")
-        new_lbl_path = os.path.join(labels_dir, f"{new_base}.txt")
-
+        if renamed == 0:
+            print(f"\n✨ 偵測到新加入的圖片，正在依內容雜湊重新命名...")
         os.rename(old_img_path, new_img_path)
+        old_lbl_path = os.path.join(labels_dir, name + ".txt")
         if os.path.exists(old_lbl_path):
-            os.rename(old_lbl_path, new_lbl_path)
+            os.rename(old_lbl_path, os.path.join(labels_dir, new_base + ".txt"))
+        old_order_path = os.path.join(order_dir, name + ".json")
+        if os.path.exists(old_order_path):
+            with open(old_order_path, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+            doc["image"] = new_filename
+            with open(os.path.join(order_dir, new_base + ".json"), "w", encoding="utf-8") as f:
+                json.dump(doc, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            os.remove(old_order_path)
+        renamed += 1
+        print(f"  • {old_filename} -> {new_filename}")
 
-        print(f"  • {old_filename} -> {new_base}{ext}")
-
-    print(f"🎉 檔名標準化完成！{dataset_name} 當前總圖片數已擴充至: {max_idx} 張\n")
+    if renamed:
+        print(f"🎉 檔名標準化完成！{dataset_name} 重新命名 {renamed} 張\n")
 
 CLASSES = {
     ord('0'): (0, "Plastic"),
@@ -478,7 +481,7 @@ def main():
         os.makedirs(images_dir, exist_ok=True)
         os.makedirs(labels_dir, exist_ok=True)
 
-        # 自動檢測並將新圖片標準化命名為 train_xxx / test_xxx
+        # 自動檢測並將新圖片標準化命名為內容雜湊
         auto_standardize_filenames(dataset_name)
 
         image_paths = []

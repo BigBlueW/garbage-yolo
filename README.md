@@ -108,6 +108,8 @@ python label_tool.py
 - `T` 鍵：在 `train`、`val`、`test` 資料集間切換。
 - `A` / `D` / `Space`：上一張 / 下一張並自動存檔。
 - 雙擊左鍵 / `Del`：刪除框。
+- 新放進 `images/` 的圖片開啟時會自動改名為**內容 SHA-256 前 8 碼**（如 `004d33fb.jpg`），label 與 `grasp_order/` 一併改名。
+- train / val / test 分法固定，舊圖片不再重新洗牌；新圖片放進哪一份由人決定（同一場景的照片放同一份）。
 
 ### 5. AI 半自動預標註工具 ([`auto_label.py`](auto_label.py))
 使用 `best.pt` 為未標註圖片自動生成初始 OBB 框：
@@ -116,9 +118,10 @@ python auto_label.py
 ```
 
 ### 6. RealSense 拍照採集工具 ([`capture_dataset.py`](capture_dataset.py))
-一鍵儲存同一物理幀的 RGB 與對齊深度圖至 `robotic-garbage-obb/demo/captures/`：
+一鍵儲存同一物理幀的 RGB 與對齊深度圖至 `robotic-garbage-obb/demo/captures/`，另存 `NNNN_info.json`（相機內參＋拍攝當下手臂 TCP）：
 ```bash
 source /opt/ros/humble/setup.bash
+source <repo>/install/setup.bash   # TCP 需要 tm_msgs；沒 source 照樣拍，只是 tcp_pose 為 null
 python3 capture_dataset.py --side left  # 或 right
 ```
 
