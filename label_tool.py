@@ -7,7 +7,7 @@ import numpy as np
 import cv2
 
 DATASET_ROOT = "robotic-garbage-obb"
-DATASETS = ["train", "val", "test"]
+DATASETS = ["train", "val", "test", "unlabeled"]
 
 HASH_LEN = 8
 
@@ -628,7 +628,7 @@ def main():
     print("                     由上往下依序點同一疊的框（自動標 上壓下），右鍵結束這一串")
     print("                     點已有的一組＝取消；同位置連點＝在重疊框間切換；亮綠框＝現在可夾")
     print("  • A / D / Space  : 上一張 / 下一張（自動存檔）")
-    print("  • T 鍵           : 切換 train / val / test 資料集")
+    print("  • T 鍵           : 切換 train / val / test / unlabeled（待標區）")
     print("  • Q / Esc        : 儲存並離開")
     print("="*55)
 

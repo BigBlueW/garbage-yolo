@@ -6,7 +6,7 @@ from ultralytics import YOLO
 
 MODEL_PATH = "best.pt"
 DATASET_ROOT = "robotic-garbage-obb"
-DATASETS = ["train", "val", "test"]
+DATASETS = ["train", "val", "test", "unlabeled"]
 
 def obb_iou(pts1, pts2):
     p1 = np.ascontiguousarray(pts1, dtype=np.float32)

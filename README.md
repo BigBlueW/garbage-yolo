@@ -105,7 +105,7 @@ python label_tool.py
 ```
 - `[` / `]`：逆時針 / 順時針旋轉 2°（`{` / `}` 為 ±10°）。
 - `0` ~ `3`：快速切換類別。
-- `T` 鍵：在 `train`、`val`、`test` 資料集間切換。
+- `T` 鍵：在 `train`、`val`、`test`、`unlabeled`（待標區）間切換。新拍的圖先放 `unlabeled/images/`，跑 `auto_label.py` 預標、這裡微調，標完再整批移到 train / test。
 - `A` / `D` / `Space`：上一張 / 下一張並自動存檔。
 - 雙擊左鍵 / `Del`：刪除框。
 - `Z`：復原（框與順序都可）。
