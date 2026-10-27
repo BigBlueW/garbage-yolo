@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from grasp_order import read_yolo_objects
+from grasp_order import load_relations, read_yolo_objects
 from grasp_sequence import complete_sequence, make_acyclic_edges, scene_from_yolo, uncertain_incoming_risks
 from order_pair_data import OrderPairDataset, build_pair_samples, transitive_relations
 from order_pair_model import PAIR_CLASSES, load_pair_model, predict_bidirectional_decision
@@ -54,18 +54,16 @@ def main():
     image_details = []
     root = Path(args.dataset)
     for order_path in sorted((root / args.split / "grasp_order").glob("*.json")):
-        document = json.loads(order_path.read_text(encoding="utf-8"))
-        if not document.get("reviewed"):
-            continue
-        image_path = root / args.split / "images" / document.get("image", f"{order_path.stem}.png")
+        image_path = next((root / args.split / "images").glob(f"{order_path.stem}.*"), None)
         label_path = root / args.split / "labels" / f"{order_path.stem}.txt"
-        image = cv2.imread(str(image_path))
+        image = cv2.imread(str(image_path)) if image_path else None
         if image is None or not label_path.exists():
             continue
-        objects = scene_from_yolo(read_yolo_objects(label_path), image.shape)
+        yolo_objects = read_yolo_objects(label_path)
+        objects = scene_from_yolo(yolo_objects, image.shape)
         if not objects:
             continue
-        gt_direct = [(int(edge["source"]), int(edge["target"])) for edge in document.get("relations", [])]
+        gt_direct = load_relations(order_path, len(yolo_objects))
         weighted = []
         pair_decisions = []
         risk_inputs = []

@@ -5,8 +5,11 @@ import math
 import argparse
 import numpy as np
 import cv2
+import torch
 from PIL import Image
 from ultralytics import YOLO
+from label_overlay import draw_labels
+from order_pair_model import load_pair_model, predict_layers
 
 CLASS_COLORS = {
     0: (46, 204, 113),   # plastic - 綠色
@@ -26,6 +29,9 @@ def parse_args():
     parser.add_argument("--iou", type=float, default=0.40, help="NMS IoU threshold")
     parser.add_argument("--duration", type=int, default=1000, help="Duration per frame in milliseconds")
     parser.add_argument("--no-grasp", action="store_true", help="Disable grasp pose overlay")
+    parser.add_argument("--order-model", type=str, default="order_model.pt", help="Path to grasp-order model")
+    parser.add_argument("--no-order", action="store_true", help="Disable grasp-order numbers (1 = graspable now)")
+    parser.add_argument("--no-conf", action="store_true", help="Hide confidence scores in labels")
     return parser.parse_args()
 
 def natural_sort_key(s):
@@ -99,11 +105,9 @@ def _tag(canvas: np.ndarray, text: str, color: tuple) -> None:
     cv2.putText(canvas, text, pos, cv2.FONT_HERSHEY_SIMPLEX, tag_scale, (0, 0, 0), tag_thick + 3, cv2.LINE_AA)
     cv2.putText(canvas, text, pos, cv2.FONT_HERSHEY_SIMPLEX, tag_scale, color, tag_thick, cv2.LINE_AA)
 
-def draw_boxes(img: np.ndarray, boxes_list, show_grasp: bool) -> np.ndarray:
+def draw_boxes(img: np.ndarray, boxes_list, show_grasp: bool, layers=None, show_conf: bool = True) -> np.ndarray:
     """在給定圖片上畫 OBB 框 + badge（+ Grasp Pose）；RGB 與 JET 深度共用（與 test_gui._draw_boxes 一致）。傳入 copy，會就地修改並回傳。"""
     img_h, img_w = img.shape[:2]
-    font_scale = max(0.85, min(1.4, img_w / 900.0))
-    font_thick = max(2, int(round(font_scale * 2.0)))
     line_thick = max(2, int(round(img_w / 450.0)))
 
     for b in boxes_list:
@@ -112,30 +116,6 @@ def draw_boxes(img: np.ndarray, boxes_list, show_grasp: bool) -> np.ndarray:
         pts = b['pts'].astype(np.int32).reshape((-1, 1, 2))
 
         cv2.polylines(img, [pts], isClosed=True, color=color, thickness=line_thick, lineType=cv2.LINE_AA)
-
-        top_pt = b['pts'][np.argmin(b['pts'][:, 1])]
-        bx, by = int(top_pt[0]), int(top_pt[1])
-
-        badge_text = f" {b['name']} {b['conf']:.2f} "
-        (tw, th), _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
-
-        pad_y = int(th * 0.35)
-        badge_y1 = max(0, by - th - pad_y * 2)
-        badge_y2 = badge_y1 + th + pad_y * 2
-        badge_x1 = max(0, bx)
-
-        text_x = max(4, badge_x1)
-        text_y = badge_y2 - pad_y
-        outline_radius = max(2, int(round(font_scale * 2.5)))
-
-        for dx in range(-outline_radius, outline_radius + 1):
-            for dy in range(-outline_radius, outline_radius + 1):
-                if dx != 0 or dy != 0:
-                    cv2.putText(img, badge_text, (text_x + dx, text_y + dy),
-                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thick + 1, cv2.LINE_AA)
-
-        cv2.putText(img, badge_text, (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, font_thick, cv2.LINE_AA)
 
         if show_grasp:
             cx, cy, bw, bh, rad = b['xywhr']
@@ -151,6 +131,9 @@ def draw_boxes(img: np.ndarray, boxes_list, show_grasp: bool) -> np.ndarray:
             p4 = (int(cx + dx2), int(cy + dy2))
             cv2.line(img, p3, p4, (0, 255, 255), max(2, line_thick), cv2.LINE_AA)
             cv2.circle(img, (int(cx), int(cy)), max(4, line_thick + 2), (0, 0, 255), -1, cv2.LINE_AA)
+
+    # 標籤最後畫，才不會被框線蓋住；位置會自動錯開
+    draw_labels(img, boxes_list, CLASS_COLORS, layers, show_conf)
 
     return img
 
@@ -172,6 +155,13 @@ def main():
 
     print(f"🚀 正在載入模型: {model_path} ...")
     model = YOLO(model_path)
+
+    order_model = None
+    if not args.no_order:
+        order_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"🚀 正在載入抓取順序模型: {args.order_model} ...")
+        order_model, order_ckpt = load_pair_model(args.order_model, order_device)
+        order_image_size = int(order_ckpt.get("image_size", 160))
     
     extensions = ["*.jpg", "*.jpeg", "*.png", "*.webp"]
     image_paths = []
@@ -233,6 +223,12 @@ def main():
         # 2. 跨類別 NMS
         boxes_list = apply_agnostic_nms(boxes_list, iou_thresh=args.iou)
 
+        # 2b. 抓取順序：每框第幾層（1＝現在可夾）
+        layers = None
+        if order_model is not None and boxes_list:
+            layers = predict_layers(order_model, img_bgr, [(b['cls'], b['pts']) for b in boxes_list],
+                                    order_image_size, order_device)
+
         # 3. 深度（與 test_gui.find_depth_for 同規則）
         depth_jet = find_depth_jet(img_path)
         depth_ok = depth_jet is not None and depth_jet.shape[:2] == (img_h, img_w)
@@ -241,13 +237,13 @@ def main():
 
         # 4. 原生解析度渲染（與 test_gui.render_panels 一致的 2x2 佈局）
         raw_display = img_bgr.copy()
-        annotated = draw_boxes(img_bgr.copy(), boxes_list, show_grasp)
+        annotated = draw_boxes(img_bgr.copy(), boxes_list, show_grasp, layers, not args.no_conf)
         _tag(raw_display, "Original", (255, 255, 255))
         _tag(annotated, f"OBB Detection ({len(boxes_list)} objects)", (0, 255, 255))
 
         col = np.hstack([raw_display, annotated])
         if depth_jet is not None:
-            depth_panel = draw_boxes(depth_jet.copy(), boxes_list, show_grasp)
+            depth_panel = draw_boxes(depth_jet.copy(), boxes_list, show_grasp, layers, not args.no_conf)
             _tag(depth_jet, "Depth", (255, 255, 0))
             _tag(depth_panel, "Depth + OBB", (255, 255, 0))
             col_depth = np.hstack([depth_jet, depth_panel])

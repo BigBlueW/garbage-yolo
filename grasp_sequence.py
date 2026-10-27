@@ -14,7 +14,7 @@ from typing import Iterable, Mapping, Sequence
 import cv2
 import numpy as np
 
-from grasp_order import compute_layers, load_document, read_yolo_objects, relation_pairs
+from grasp_order import compute_layers, load_relations, read_yolo_objects
 
 
 CLASS_NAMES = {0: "Plastic", 1: "Metal", 2: "Paper", 3: "General Waste"}
@@ -196,13 +196,7 @@ def load_annotated_scene(
     if image is None:
         raise FileNotFoundError(f"Cannot read image: {image_path}")
     objects = read_yolo_objects(label_path)
-    document, issues = load_document(order_path, image_name, objects)
-    errors = [issue.message for issue in issues if issue.severity == "error"]
-    if errors:
-        raise ValueError("; ".join(errors))
-    if not document.get("reviewed"):
-        raise ValueError(f"Order annotation is not reviewed: {order_path}")
-    return image, scene_from_yolo(objects, image.shape), relation_pairs(document)
+    return image, scene_from_yolo(objects, image.shape), load_relations(order_path, len(objects))
 
 
 def render_sequence(

@@ -8,7 +8,10 @@ import numpy as np
 import cv2
 from PIL import Image, ImageTk
 import customtkinter as ctk
+import torch
 from ultralytics import YOLO
+from label_overlay import draw_labels
+from order_pair_model import load_pair_model, predict_layers
 import argparse
 
 def parse_args():
@@ -30,6 +33,7 @@ ctk.set_default_color_theme("dark-blue")
 # Config Paths
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(REPO_ROOT, "best.pt")
+ORDER_MODEL_PATH = os.path.join(REPO_ROOT, "order_model.pt")
 # --path 先照 cwd 解析，不存在再相對 repo 根（讓從任何目錄啟動都能用）
 if not os.path.isdir(args.path) and os.path.isdir(os.path.join(REPO_ROOT, args.path)):
     args.path = os.path.join(REPO_ROOT, args.path)
@@ -200,7 +204,7 @@ class App(ctk.CTk):
         # --- Sidebar Frame ---
         self.sidebar_frame = ctk.CTkFrame(self, width=280, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(12, weight=1)
+        self.sidebar_frame.grid_rowconfigure(14, weight=1)
 
         self.logo_label = ctk.CTkLabel(
             self.sidebar_frame, 
@@ -294,7 +298,25 @@ class App(ctk.CTk):
             command=self.run_inference
         )
         self.grasp_switch.select()
-        self.grasp_switch.grid(row=8, column=0, padx=20, pady=(5, 15), sticky="w")
+        self.grasp_switch.grid(row=8, column=0, padx=20, pady=(5, 10), sticky="w")
+
+        # Grasp Order Switch（框中心的數字＝第幾層；1＝現在可夾，預設開啟）
+        self.order_switch = ctk.CTkSwitch(
+            self.sidebar_frame,
+            text="Grasp Order",
+            command=self.run_inference
+        )
+        self.order_switch.select()
+        self.order_switch.grid(row=9, column=0, padx=20, pady=(5, 10), sticky="w")
+
+        # Show Conf Switch（標籤是否附信心值，預設開啟）
+        self.conf_switch = ctk.CTkSwitch(
+            self.sidebar_frame,
+            text="Show Conf",
+            command=self.run_inference
+        )
+        self.conf_switch.select()
+        self.conf_switch.grid(row=10, column=0, padx=20, pady=(5, 15), sticky="w")
 
         self.load_btn = ctk.CTkButton(
             self.sidebar_frame, 
@@ -303,7 +325,7 @@ class App(ctk.CTk):
             height=36,
             font=ctk.CTkFont(size=14, weight="bold")
         )
-        self.load_btn.grid(row=9, column=0, padx=20, pady=(5, 5))
+        self.load_btn.grid(row=11, column=0, padx=20, pady=(5, 5))
 
         self.select_btn = ctk.CTkButton(
             self.sidebar_frame, 
@@ -314,11 +336,11 @@ class App(ctk.CTk):
             hover_color="#326ba3",
             font=ctk.CTkFont(size=14, weight="bold")
         )
-        self.select_btn.grid(row=10, column=0, padx=20, pady=(5, 10))
+        self.select_btn.grid(row=12, column=0, padx=20, pady=(5, 10))
 
         # Legend Box
         self.legend_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        self.legend_frame.grid(row=11, column=0, padx=20, pady=10, sticky="w")
+        self.legend_frame.grid(row=13, column=0, padx=20, pady=10, sticky="w")
         
         legend_items = [
             ("Plastic", "#2ecc71"),
@@ -385,6 +407,14 @@ class App(ctk.CTk):
                         break
 
             self.model = YOLO(model_to_load)
+            self.order_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.order_model = None
+            if os.path.exists(ORDER_MODEL_PATH):
+                self.order_model, order_ckpt = load_pair_model(ORDER_MODEL_PATH, self.order_device)
+                self.order_image_size = int(order_ckpt.get("image_size", 160))
+            else:
+                self.order_switch.deselect()
+                self.order_switch.configure(state="disabled")
             self.model_status_label.configure(
                 text=f"Ready: {os.path.basename(model_to_load)}", 
                 text_color="#28a745"
@@ -507,6 +537,7 @@ class App(ctk.CTk):
         iou_thresh = self.iou_slider.get()
         use_agnostic_nms = self.agnostic_switch.get() == 1
         show_grasp = self.grasp_switch.get() == 1
+        show_conf = self.conf_switch.get() == 1
         
         # 1. Model inference
         results = self.model(self.raw_image_bgr, conf=conf_thresh, iou=iou_thresh, verbose=False)[0]
@@ -545,26 +576,31 @@ class App(ctk.CTk):
             for i, b in enumerate(boxes_list):
                 self._metric_info[i] = box_metric_info(b, self._depth_mm_current, *self._intrinsics())
 
+        # 3c. 抓取順序：每框第幾層（1＝現在可夾）
+        layers = None
+        if self.order_switch.get() == 1 and self.order_model is not None and boxes_list:
+            layers = predict_layers(self.order_model, self.raw_image_bgr,
+                                    [(b['cls'], b['pts']) for b in boxes_list],
+                                    self.order_image_size, self.order_device)
+
         # 4. Clean & Minimalist Rendering
         img_h, img_w = self.raw_image_bgr.shape[:2]
-        annotated = self._draw_boxes(self.raw_image_bgr.copy(), boxes_list, show_grasp)
+        annotated = self._draw_boxes(self.raw_image_bgr.copy(), boxes_list, show_grasp, layers, show_conf)
         depth_panel = None
         if (
             self.current_depth_jet is not None
             and self.current_depth_jet.shape[:2] == (img_h, img_w)
         ):
-            depth_panel = self._draw_boxes(self.current_depth_jet.copy(), boxes_list, show_grasp)
+            depth_panel = self._draw_boxes(self.current_depth_jet.copy(), boxes_list, show_grasp, layers, show_conf)
 
         self.render_panels(annotated, boxes_list, depth_panel)
 
     # --- Hover-to-inspect (continued in App methods below) ---
-    def _draw_boxes(self, annotated: np.ndarray, boxes_list, show_grasp: bool) -> np.ndarray:
-        """在給定圖片上畫 OBB 框 + badge（+Grasp Pose）；回傳同一張圖。RGB 與 JET 深度共用"""
+    def _draw_boxes(self, annotated: np.ndarray, boxes_list, show_grasp: bool, layers=None,
+                    show_conf: bool = True) -> np.ndarray:
+        """在給定圖片上畫 OBB 框 + badge（+Grasp Pose）（+抓取順序數字）；回傳同一張圖。RGB 與 JET 深度共用"""
         img_h, img_w = annotated.shape[:2]
 
-        # Adaptive font scale and line thickness based on image resolution
-        font_scale = max(0.85, min(1.4, img_w / 900.0))
-        font_thick = max(2, int(round(font_scale * 2.0)))
         line_thick = max(2, int(round(img_w / 450.0)))
 
         for b in boxes_list:
@@ -574,41 +610,6 @@ class App(ctk.CTk):
             
             # Clean oriented bounding box border
             cv2.polylines(annotated, [pts], isClosed=True, color=color, thickness=line_thick, lineType=cv2.LINE_AA)
-            
-            # Top-left corner point for badge
-            top_pt = b['pts'][np.argmin(b['pts'][:, 1])]
-            bx, by = int(top_pt[0]), int(top_pt[1])
-            
-            # Badge text: e.g. "plastic 0.91"
-            badge_text = f" {b['name']} {b['conf']:.2f} "
-            (tw, th), baseline = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
-            
-            # Draw badge background with neat padding
-            pad_y = int(th * 0.35)
-            badge_y1 = max(0, by - th - pad_y * 2)
-            badge_y2 = badge_y1 + th + pad_y * 2
-            badge_x1 = max(0, bx)
-            badge_x2 = min(annotated.shape[1], badge_x1 + tw)
-            
-            # Draw solid badge background with slightly darker inner border
-            # cv2.rectangle(annotated, (badge_x1, badge_y1), (badge_x2, badge_y2), color, -1)
-            # cv2.rectangle(annotated, (badge_x1, badge_y1), (badge_x2, badge_y2), (0, 0, 0), 1)
-            
-            # 繪製醒目白色描邊（8 方向擴展純白外框，確保在任何背景皆有清晰白邊）
-            text_x = max(4, badge_x1)
-            text_y = badge_y2 - pad_y
-            outline_radius = max(2, int(round(font_scale * 2.5)))
-            
-            # 先以多重偏移繪製純白實心描邊
-            for dx in range(-outline_radius, outline_radius + 1):
-                for dy in range(-outline_radius, outline_radius + 1):
-                    if dx != 0 or dy != 0:
-                        cv2.putText(annotated, badge_text, (text_x + dx, text_y + dy),
-                                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thick + 1, cv2.LINE_AA)
-            
-            # 再於中心繪製類別專屬顏色文字
-            cv2.putText(annotated, badge_text, (text_x, text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, font_thick, cv2.LINE_AA)
 
             # Optional Grasp Pose Overlay
             if show_grasp:
@@ -625,6 +626,9 @@ class App(ctk.CTk):
                 p4 = (int(cx + dx2), int(cy + dy2))
                 cv2.line(annotated, p3, p4, (0, 255, 255), max(2, line_thick), cv2.LINE_AA)
                 cv2.circle(annotated, (int(cx), int(cy)), max(4, line_thick + 2), (0, 0, 255), -1, cv2.LINE_AA)
+
+        # 標籤最後畫，才不會被框線蓋住；位置會自動錯開
+        draw_labels(annotated, boxes_list, CLASS_COLORS, layers, show_conf)
 
         return annotated
 

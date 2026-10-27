@@ -70,7 +70,8 @@ def parse_args():
     parser.add_argument("--samples-per-epoch", type=int, default=0,
                         help="Balanced-sampler draws per epoch; 0 uses six times the smaller direction class")
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--patience", type=int, default=12)
+    parser.add_argument("--patience", type=int, default=12,
+                        help="0 = no early stopping: cosine LR over all epochs and keep the last epoch")
     parser.add_argument("--symmetry-weight", type=float, default=0.2,
                         help="Penalty for disagreement between AB and swapped BA predictions")
     parser.add_argument("--seed", type=int, default=42)
@@ -134,7 +135,10 @@ def main():
         ], weight_decay=1e-4)
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=4)
+    if args.patience > 0:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=4)
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     best_f1, stale = -1.0, 0
@@ -161,10 +165,13 @@ def main():
             optimizer.step()
             train_losses.append(float(loss.item()))
         result = evaluate(model, val_loader, criterion, device)
-        scheduler.step(result["macro_f1"])
+        if args.patience > 0:
+            scheduler.step(result["macro_f1"])
+        else:
+            scheduler.step()
         print(f"epoch={epoch:03d} train_loss={np.mean(train_losses):.4f} "
               f"val_loss={result['loss']:.4f} val_acc={result['accuracy']:.3f} val_macro_f1={result['macro_f1']:.3f}")
-        if result["macro_f1"] > best_f1 + 1e-4:
+        if args.patience <= 0 or result["macro_f1"] > best_f1 + 1e-4:
             best_f1, stale = result["macro_f1"], 0
             torch.save({
                 "model_state": model.state_dict(), "geometry_size": GEOMETRY_SIZE,

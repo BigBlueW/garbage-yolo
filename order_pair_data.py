@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +11,7 @@ import cv2
 import torch
 from torch.utils.data import Dataset
 
-from grasp_order import read_yolo_objects, validate_document
+from grasp_order import load_relations, read_yolo_objects
 from grasp_sequence import scene_from_yolo
 from order_pair_model import pair_is_candidate, pair_tensor
 
@@ -54,23 +53,19 @@ def build_pair_samples(
     positives: list[PairSample] = []
     negatives: list[PairSample] = []
     for order_path in sorted(order_dir.glob("*.json")):
-        document = json.loads(order_path.read_text(encoding="utf-8"))
-        if not document.get("reviewed"):
-            continue
-        image_name = document.get("image") or f"{order_path.stem}.png"
-        image_path = root / split / "images" / image_name
+        image_path = next((root / split / "images").glob(f"{order_path.stem}.*"), None)
         label_path = root / split / "labels" / f"{order_path.stem}.txt"
-        if not image_path.exists() or not label_path.exists():
+        if image_path is None or not label_path.exists():
             continue
         yolo_objects = read_yolo_objects(label_path)
-        errors = [issue for issue in validate_document(document, yolo_objects) if issue.severity == "error"]
-        if errors:
-            raise ValueError(f"Invalid {order_path}: " + "; ".join(issue.message for issue in errors))
+        try:
+            direct = load_relations(order_path, len(yolo_objects))
+        except ValueError as exc:
+            raise ValueError(f"Invalid {order_path}: {exc}") from exc
         image = cv2.imread(str(image_path))
         if image is None:
             raise FileNotFoundError(f"Cannot read {image_path}")
         objects = scene_from_yolo(yolo_objects, image.shape)
-        direct = [(int(edge["source"]), int(edge["target"])) for edge in document.get("relations", [])]
         before = transitive_relations(len(objects), direct)
         for a_id in range(len(objects)):
             for b_id in range(a_id + 1, len(objects)):

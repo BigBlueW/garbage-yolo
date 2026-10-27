@@ -87,6 +87,7 @@ python test_gui.py
 - **資料夾切換**：下拉選單自動列出 `robotic-garbage-obb/` 下所有圖片資料夾（`test/images`、`val/images`、`demo/captures` 等）。
 - **2×2 四格顯示**：原圖、OBB 標注、JET 深度圖、深度＋OBB 標注。
 - **hover-to-inspect**：滑鼠移到偵測框即時顯示 3D 空間相機座標 (`pos`)、Yaw 抓取旋轉角 (`angle`) 與夾爪開合寬度 (`grip mm`)。
+- **Grasp Order**：標籤左邊的數字＝第幾層（綠色 `1`＝上面沒東西壓、現在可夾；灰色 `2`、`3`…＝要等上一層拿走），由 `order_model.pt` 判斷。**Show Conf** 切換標籤是否附信心值。
 
 ### 2. 端到端 OBB 訓練 ([`train.py`](train.py))
 以 `yolo11x-obb.pt` 為基底進行全權重訓練，內建餘弦退火排程與旋轉資料增強：
@@ -128,6 +129,14 @@ source /opt/ros/humble/setup.bash
 source <repo>/install/setup.bash   # TCP 需要 tm_msgs；沒 source 照樣拍，只是 tcp_pose 為 null
 python3 capture_dataset.py --side left  # 或 right
 ```
+
+### 7. 抓取順序模型 ([`train_order_model.py`](train_order_model.py))
+兩兩判斷「誰壓在誰上面」的小模型（只用 RGB），訓練資料是 `label_tool.py` 按 `Tab` 標的 `grasp_order/*.json`。筆電 GPU 約 3 分鐘：
+```bash
+python train_order_model.py --architecture tiny_cnn --patience 0 --epochs 30 --output order_runs/order_model_tiny_fixed30.pt
+python evaluate_order_model.py --model order_runs/order_model_tiny_fixed30.pt --split test
+```
+`--patience 0`＝不提早停、存最後一輪（val 只有 3 張有順序標註，不適合拿來挑 epoch）。目前的 `order_model.pt` 在 test（21 張）上第一夾安全率 1.00、三類 macro-F1 0.79、畫出的關係 precision 0.90 / recall 0.49。設計與實驗紀錄見 [`GRASP_SEQUENCE.md`](GRASP_SEQUENCE.md)。
 
 ---
 

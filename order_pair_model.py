@@ -11,7 +11,8 @@ import numpy as np
 import torch
 from torch import nn
 
-from grasp_sequence import SceneObject
+from grasp_order import compute_layers
+from grasp_sequence import SceneObject, make_acyclic_edges
 
 
 PAIR_CLASSES = ("A_before_B", "B_before_A", "no_relation")
@@ -193,6 +194,37 @@ def predict_bidirectional_decision(
         return RelationDecision("uncertain", kind, label_ab, confidence, f"confidence below {required:.2f}")
     combined = float(((ab[label_ab] + ba_as_ab[label_ab]) / 2).item())
     return RelationDecision("relation", kind, label_ab, combined, "bidirectional agreement")
+
+
+@torch.no_grad()
+def predict_layers(
+    model: nn.Module,
+    image: np.ndarray,
+    boxes: Sequence[tuple[int, np.ndarray]],
+    image_size: int,
+    device: torch.device,
+    threshold: float = 0.80,
+) -> list[int]:
+    """Grasp layer per detected box: 1 = nothing on top (graspable now), 2 = after layer 1, ...
+
+    ``boxes`` is ``[(class_id, 4x2 pixel corners), ...]`` in detection order.
+    """
+    objects = [SceneObject(i, int(cls), np.asarray(pts, dtype=np.float32)) for i, (cls, pts) in enumerate(boxes)]
+    candidates = []
+    for a_id in range(len(objects)):
+        for b_id in range(a_id + 1, len(objects)):
+            decision = predict_bidirectional_decision(
+                model, image, objects[a_id], objects[b_id], image_size, device, threshold,
+            )
+            if decision.status == "relation" and decision.label is not None:
+                source, target = (a_id, b_id) if decision.label == 0 else (b_id, a_id)
+                candidates.append((source, target, decision.confidence))
+    accepted, _ = make_acyclic_edges(len(objects), candidates)
+    layer_of = [0] * len(objects)
+    for number, layer in enumerate(compute_layers(len(objects), accepted), start=1):
+        for index in layer:
+            layer_of[index] = number
+    return layer_of
 
 
 def predict_bidirectional_relation(*args, **kwargs) -> tuple[int, float] | None:
