@@ -650,7 +650,7 @@ def main():
         for ext in extensions:
             image_paths.extend(glob.glob(os.path.join(images_dir, ext)))
             image_paths.extend(glob.glob(os.path.join(images_dir, ext.upper())))
-        image_paths = sorted(image_paths)
+        image_paths = sorted(set(image_paths))
 
         if not image_paths:
             print(f"⚠️ {dataset_name} 資料夾中沒有找到圖片。按 T 可切換資料夾。")
