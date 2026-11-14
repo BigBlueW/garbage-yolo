@@ -181,7 +181,9 @@ def main():
     # 深度預覽圖（*_depth_jet.png）不是資料圖，排除掉（與 test_gui.load_random_image 一致）
     image_paths = [p for p in image_paths if not os.path.basename(p).endswith("_depth_jet.png")]
 
-    image_paths = sorted(image_paths, key=natural_sort_key)
+    # On case-insensitive filesystems, ``*.png`` and ``*.PNG`` return the same
+    # files.  De-duplicate before rendering so each capture becomes one frame.
+    image_paths = sorted(set(image_paths), key=natural_sort_key)
     total_imgs = len(image_paths)
     if total_imgs == 0:
         print(f"❌ 在目錄 '{args.path}' 中找不到任何圖片！")

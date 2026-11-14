@@ -87,7 +87,7 @@ python test_gui.py
 - **資料夾切換**：下拉選單自動列出 `robotic-garbage-obb/` 下所有圖片資料夾（`test/images`、`val/images`、`demo/captures` 等）。
 - **2×2 四格顯示**：原圖、OBB 標注、JET 深度圖、深度＋OBB 標注。
 - **hover-to-inspect**：滑鼠移到偵測框即時顯示 3D 空間相機座標 (`pos`)、Yaw 抓取旋轉角 (`angle`) 與夾爪開合寬度 (`grip mm`)。
-- **Grasp Order**：標籤左邊的數字＝第幾層（綠色 `1`＝上面沒東西壓、現在可夾；灰色 `2`、`3`…＝要等上一層拿走），由 `order_model.pt` 判斷。**Show Conf** 切換標籤是否附信心值。
+- **Grasp Order**：標籤左邊的數字＝第幾層；紅色 `NEXT` 是目前建議第一個夾的物件，第一層其他物件為綠色，第二層起各層使用不同顏色。層級由 `order_model.pt` 判斷，同層再依不確定風險、偵測信心、邊界安全程度與物件間距離排序。**Show Conf** 切換標籤是否附信心值。
 
 ### 2. 端到端 OBB 訓練 ([`train.py`](train.py))
 以 `yolo11x-obb.pt` 為基底進行全權重訓練，內建餘弦退火排程與旋轉資料增強：
