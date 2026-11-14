@@ -10,8 +10,8 @@ from PIL import Image, ImageTk
 import customtkinter as ctk
 import torch
 from ultralytics import YOLO
-from label_overlay import draw_labels
-from order_pair_model import load_pair_model, predict_layers
+from label_overlay import draw_labels, grasp_order_color
+from order_pair_model import load_pair_model, predict_grasp_plan
 import argparse
 
 def parse_args():
@@ -392,8 +392,12 @@ class App(ctk.CTk):
         self._panel_layout: dict | None = None       # img_w / top_h / divider_h
         self._depth_mm_current: np.ndarray | None = None  # 目前圖的 raw depth（uint16 mm）
 
+        # Show the window before loading the large detector weights.  A short
+        # topmost pulse prevents Tk from opening silently behind the terminal;
+        # it is released as soon as the normal event loop starts.
+        self._show_in_foreground()
+
         # Load the custom trained model
-        self.update()
         try:
             model_to_load = MODEL_PATH
             if not os.path.exists(model_to_load):
@@ -422,6 +426,18 @@ class App(ctk.CTk):
             self.load_random_image()
         except Exception as e:
             self.model_status_label.configure(text=f"Load Failed: {str(e)[:20]}", text_color="#dc3545")
+
+    def _show_in_foreground(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)
+        self.focus_force()
+        self.update()
+        self.after(400, self._release_startup_topmost)
+
+    def _release_startup_topmost(self) -> None:
+        if self.winfo_exists():
+            self.attributes("-topmost", False)
 
     def update_sliders(self, value=None):
         conf_val = self.conf_slider.get()
@@ -576,36 +592,47 @@ class App(ctk.CTk):
             for i, b in enumerate(boxes_list):
                 self._metric_info[i] = box_metric_info(b, self._depth_mm_current, *self._intrinsics())
 
-        # 3c. 抓取順序：每框第幾層（1＝現在可夾）
+        # 3c. 抓取順序：每框的層級與同層安全排序（rank 1＝下一個夾）
         layers = None
+        ranks = None
         if self.order_switch.get() == 1 and self.order_model is not None and boxes_list:
-            layers = predict_layers(self.order_model, self.raw_image_bgr,
-                                    [(b['cls'], b['pts']) for b in boxes_list],
-                                    self.order_image_size, self.order_device)
+            layers, ranks = predict_grasp_plan(
+                self.order_model,
+                self.raw_image_bgr,
+                [(b['cls'], b['pts'], b['conf']) for b in boxes_list],
+                self.order_image_size,
+                self.order_device,
+            )
 
         # 4. Clean & Minimalist Rendering
         img_h, img_w = self.raw_image_bgr.shape[:2]
-        annotated = self._draw_boxes(self.raw_image_bgr.copy(), boxes_list, show_grasp, layers, show_conf)
+        annotated = self._draw_boxes(
+            self.raw_image_bgr.copy(), boxes_list, show_grasp, layers, show_conf, ranks,
+        )
         depth_panel = None
         if (
             self.current_depth_jet is not None
             and self.current_depth_jet.shape[:2] == (img_h, img_w)
         ):
-            depth_panel = self._draw_boxes(self.current_depth_jet.copy(), boxes_list, show_grasp, layers, show_conf)
+            depth_panel = self._draw_boxes(
+                self.current_depth_jet.copy(), boxes_list, show_grasp, layers, show_conf, ranks,
+            )
 
         self.render_panels(annotated, boxes_list, depth_panel)
 
     # --- Hover-to-inspect (continued in App methods below) ---
     def _draw_boxes(self, annotated: np.ndarray, boxes_list, show_grasp: bool, layers=None,
-                    show_conf: bool = True) -> np.ndarray:
+                    show_conf: bool = True, ranks=None) -> np.ndarray:
         """在給定圖片上畫 OBB 框 + badge（+Grasp Pose）（+抓取順序數字）；回傳同一張圖。RGB 與 JET 深度共用"""
         img_h, img_w = annotated.shape[:2]
 
         line_thick = max(2, int(round(img_w / 450.0)))
 
-        for b in boxes_list:
+        for i, b in enumerate(boxes_list):
             cls_id = b['cls']
-            color = CLASS_COLORS.get(cls_id, (0, 255, 0))
+            is_first_pick = ranks is not None and ranks[i] == 1
+            color = (grasp_order_color(layers[i], is_first_pick) if layers is not None
+                     else CLASS_COLORS.get(cls_id, (0, 255, 0)))
             pts = b['pts'].astype(np.int32).reshape((-1, 1, 2))
             
             # Clean oriented bounding box border
@@ -628,7 +655,7 @@ class App(ctk.CTk):
                 cv2.circle(annotated, (int(cx), int(cy)), max(4, line_thick + 2), (0, 0, 255), -1, cv2.LINE_AA)
 
         # 標籤最後畫，才不會被框線蓋住；位置會自動錯開
-        draw_labels(annotated, boxes_list, CLASS_COLORS, layers, show_conf)
+        draw_labels(annotated, boxes_list, CLASS_COLORS, layers, show_conf, ranks)
 
         return annotated
 

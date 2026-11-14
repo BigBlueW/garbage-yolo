@@ -1,11 +1,15 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
 from grasp_sequence import SceneObject, complete_sequence, make_acyclic_edges, uncertain_incoming_risks
+from label_overlay import FIRST_PICK_COLOR, grasp_order_color
 from order_pair_data import transitive_relations
-from order_pair_model import pair_candidate_kind, swap_pair_batch, swap_pair_targets
+from order_pair_model import (
+    RelationDecision, pair_candidate_kind, predict_grasp_plan, swap_pair_batch, swap_pair_targets,
+)
 
 
 def obj(index, x, y):
@@ -58,6 +62,33 @@ class GraspSequenceTests(unittest.TestCase):
         ranked, _ = complete_sequence(objects, [], (100, 100, 3), risks)
         self.assertNotEqual(ranked[0].object_id, 1)
         self.assertEqual(ranked[-1].object_id, 1)
+
+    def test_grasp_plan_returns_unique_first_pick_inside_layer_one(self):
+        boxes = [
+            (0, obj(0, 20, 20).points, 0.50),
+            (1, obj(1, 50, 50).points, 0.99),
+            (2, obj(2, 80, 80).points, 0.90),
+        ]
+
+        def relation_for_pair(_model, _image, a, b, _size, _device, _threshold):
+            if (a.id, b.id) == (0, 2):
+                return RelationDecision("relation", "intersect", 0, 0.95, "test")
+            return RelationDecision("no_relation", "intersect", 2, 0.95, "test")
+
+        with patch("order_pair_model.predict_bidirectional_decision", side_effect=relation_for_pair):
+            layers, ranks = predict_grasp_plan(
+                None, np.zeros((100, 100, 3), dtype=np.uint8), boxes, 160, torch.device("cpu"),
+            )
+
+        self.assertEqual(layers, [1, 1, 2])
+        self.assertEqual(ranks, [2, 1, 3])
+
+    def test_first_pick_is_red_and_other_layers_have_stable_distinct_colors(self):
+        self.assertEqual(grasp_order_color(1, True), FIRST_PICK_COLOR)
+        self.assertNotEqual(grasp_order_color(1), FIRST_PICK_COLOR)
+        self.assertNotEqual(grasp_order_color(1), grasp_order_color(2))
+        self.assertEqual(grasp_order_color(2), grasp_order_color(2))
+        self.assertNotIn(grasp_order_color(7), {grasp_order_color(i) for i in range(1, 7)})
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from grasp_order import compute_layers, load_relations, read_yolo_objects
+from label_overlay import grasp_order_color
 
 
 CLASS_NAMES = {0: "Plastic", 1: "Metal", 2: "Paper", 3: "General Waste"}
@@ -227,12 +228,13 @@ def render_sequence(
                     (220, 220, 220), 2, cv2.LINE_AA)
     for item in ranked:
         obj = by_id[item.object_id]
-        color = CLASS_COLORS.get(obj.class_id, (255, 255, 255))
+        is_first_pick = item.rank == 1
+        color = grasp_order_color(item.layer, is_first_pick)
         polygon = np.rint(obj.points).astype(np.int32)
         cv2.polylines(canvas, [polygon], True, color, 3, cv2.LINE_AA)
         cx, cy = (int(v) for v in obj.center)
         radius = 22
-        cv2.circle(canvas, (cx, cy), radius, (20, 20, 20), -1, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), radius, color, -1, cv2.LINE_AA)
         cv2.circle(canvas, (cx, cy), radius, (255, 255, 255), 2, cv2.LINE_AA)
         label = str(item.rank)
         size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)

@@ -8,8 +8,8 @@ import cv2
 import torch
 from PIL import Image
 from ultralytics import YOLO
-from label_overlay import draw_labels
-from order_pair_model import load_pair_model, predict_layers
+from label_overlay import draw_labels, grasp_order_color
+from order_pair_model import load_pair_model, predict_grasp_plan
 
 CLASS_COLORS = {
     0: (46, 204, 113),   # plastic - 綠色
@@ -105,14 +105,23 @@ def _tag(canvas: np.ndarray, text: str, color: tuple) -> None:
     cv2.putText(canvas, text, pos, cv2.FONT_HERSHEY_SIMPLEX, tag_scale, (0, 0, 0), tag_thick + 3, cv2.LINE_AA)
     cv2.putText(canvas, text, pos, cv2.FONT_HERSHEY_SIMPLEX, tag_scale, color, tag_thick, cv2.LINE_AA)
 
-def draw_boxes(img: np.ndarray, boxes_list, show_grasp: bool, layers=None, show_conf: bool = True) -> np.ndarray:
+def draw_boxes(
+    img: np.ndarray,
+    boxes_list,
+    show_grasp: bool,
+    layers=None,
+    show_conf: bool = True,
+    ranks=None,
+) -> np.ndarray:
     """在給定圖片上畫 OBB 框 + badge（+ Grasp Pose）；RGB 與 JET 深度共用（與 test_gui._draw_boxes 一致）。傳入 copy，會就地修改並回傳。"""
     img_h, img_w = img.shape[:2]
     line_thick = max(2, int(round(img_w / 450.0)))
 
-    for b in boxes_list:
+    for i, b in enumerate(boxes_list):
         cls_id = b['cls']
-        color = CLASS_COLORS.get(cls_id, (0, 255, 0))
+        is_first_pick = ranks is not None and ranks[i] == 1
+        color = (grasp_order_color(layers[i], is_first_pick) if layers is not None
+                 else CLASS_COLORS.get(cls_id, (0, 255, 0)))
         pts = b['pts'].astype(np.int32).reshape((-1, 1, 2))
 
         cv2.polylines(img, [pts], isClosed=True, color=color, thickness=line_thick, lineType=cv2.LINE_AA)
@@ -133,7 +142,7 @@ def draw_boxes(img: np.ndarray, boxes_list, show_grasp: bool, layers=None, show_
             cv2.circle(img, (int(cx), int(cy)), max(4, line_thick + 2), (0, 0, 255), -1, cv2.LINE_AA)
 
     # 標籤最後畫，才不會被框線蓋住；位置會自動錯開
-    draw_labels(img, boxes_list, CLASS_COLORS, layers, show_conf)
+    draw_labels(img, boxes_list, CLASS_COLORS, layers, show_conf, ranks)
 
     return img
 
@@ -223,11 +232,17 @@ def main():
         # 2. 跨類別 NMS
         boxes_list = apply_agnostic_nms(boxes_list, iou_thresh=args.iou)
 
-        # 2b. 抓取順序：每框第幾層（1＝現在可夾）
+        # 2b. 抓取順序：每框層級 + 同層排序（rank 1＝下一個夾）
         layers = None
+        ranks = None
         if order_model is not None and boxes_list:
-            layers = predict_layers(order_model, img_bgr, [(b['cls'], b['pts']) for b in boxes_list],
-                                    order_image_size, order_device)
+            layers, ranks = predict_grasp_plan(
+                order_model,
+                img_bgr,
+                [(b['cls'], b['pts'], b['conf']) for b in boxes_list],
+                order_image_size,
+                order_device,
+            )
 
         # 3. 深度（與 test_gui.find_depth_for 同規則）
         depth_jet = find_depth_jet(img_path)
@@ -237,13 +252,17 @@ def main():
 
         # 4. 原生解析度渲染（與 test_gui.render_panels 一致的 2x2 佈局）
         raw_display = img_bgr.copy()
-        annotated = draw_boxes(img_bgr.copy(), boxes_list, show_grasp, layers, not args.no_conf)
+        annotated = draw_boxes(
+            img_bgr.copy(), boxes_list, show_grasp, layers, not args.no_conf, ranks,
+        )
         _tag(raw_display, "Original", (255, 255, 255))
         _tag(annotated, f"OBB Detection ({len(boxes_list)} objects)", (0, 255, 255))
 
         col = np.hstack([raw_display, annotated])
         if depth_jet is not None:
-            depth_panel = draw_boxes(depth_jet.copy(), boxes_list, show_grasp, layers, not args.no_conf)
+            depth_panel = draw_boxes(
+                depth_jet.copy(), boxes_list, show_grasp, layers, not args.no_conf, ranks,
+            )
             _tag(depth_jet, "Depth", (255, 255, 0))
             _tag(depth_panel, "Depth + OBB", (255, 255, 0))
             col_depth = np.hstack([depth_jet, depth_panel])

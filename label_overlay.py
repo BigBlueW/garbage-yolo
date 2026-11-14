@@ -2,16 +2,53 @@
 
 from __future__ import annotations
 
+import colorsys
+
 import cv2
 import numpy as np
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
+# OpenCV uses BGR colors.  The first recommendation is deliberately reserved
+# for red; all remaining detections share a stable color with their layer.
+FIRST_PICK_COLOR = (0, 0, 255)
+LAYER_COLORS = (
+    (0, 190, 0),      # layer 1: green
+    (0, 150, 255),    # layer 2: orange
+    (255, 120, 0),    # layer 3: blue
+    (180, 70, 180),   # layer 4: purple
+    (180, 170, 0),    # layer 5: cyan/teal
+    (80, 80, 210),    # layer 6: coral
+)
 
-def draw_layer_number(image: np.ndarray, center: tuple[float, float], layer: int, radius: int) -> None:
-    """Filled circle with the grasp layer; layer 1 (graspable now) is bright green, deeper layers gray."""
+
+def grasp_order_color(layer: int, is_first_pick: bool = False) -> tuple[int, int, int]:
+    """Return the stable BGR visualization color for a grasp layer."""
+    if is_first_pick:
+        return FIRST_PICK_COLOR
+    if layer < 1:
+        return (160, 160, 160)
+    if layer <= len(LAYER_COLORS):
+        return LAYER_COLORS[layer - 1]
+    # Generate additional stable colors instead of repeating an earlier layer.
+    hue = (0.18 + (layer - 1) * 0.61803398875) % 1.0
+    if hue < 0.06 or hue > 0.94:  # keep the reserved NEXT red unambiguous
+        hue = (hue + 0.10) % 1.0
+    red, green, blue = colorsys.hsv_to_rgb(hue, 0.82, 0.88)
+    return int(blue * 255), int(green * 255), int(red * 255)
+
+
+def draw_layer_number(
+    image: np.ndarray,
+    center: tuple[float, float],
+    layer: int,
+    radius: int,
+    is_first_pick: bool = False,
+) -> None:
+    """Draw a layer badge; the first recommended grasp is always red."""
     cx, cy = int(center[0]), int(center[1])
-    fill, text_color = ((0, 220, 0), (0, 0, 0)) if layer == 1 else ((110, 110, 110), (255, 255, 255))
+    fill = grasp_order_color(layer, is_first_pick)
+    text_color = (255, 255, 255)
     cv2.circle(image, (cx, cy), radius, fill, -1, cv2.LINE_AA)
     cv2.circle(image, (cx, cy), radius, (255, 255, 255), max(1, radius // 8), cv2.LINE_AA)
     scale = radius / 20.0
@@ -26,7 +63,14 @@ def _overlaps(rect, placed) -> bool:
     return any(x1 < px2 and px1 < x2 and y1 < py2 and py1 < y2 for px1, py1, px2, py2 in placed)
 
 
-def draw_labels(image: np.ndarray, boxes_list, colors: dict, layers=None, show_conf: bool = True) -> None:
+def draw_labels(
+    image: np.ndarray,
+    boxes_list,
+    colors: dict,
+    layers=None,
+    show_conf: bool = True,
+    ranks=None,
+) -> None:
     """Draw one badge per box ("(1) plastic 0.91") above its top corner, nudged up/down to avoid other badges."""
     img_h, img_w = image.shape[:2]
     scale = max(0.45, min(0.75, img_w / 1700.0))
@@ -39,6 +83,9 @@ def draw_labels(image: np.ndarray, boxes_list, colors: dict, layers=None, show_c
     for i in sorted(range(len(boxes_list)), key=lambda k: float(boxes_list[k]['pts'][:, 1].min())):
         b = boxes_list[i]
         text = f"{b['name']} {b['conf']:.2f}" if show_conf else b['name']
+        is_first_pick = ranks is not None and ranks[i] == 1
+        if is_first_pick:
+            text = f"NEXT {text}"
         (tw, th), baseline = cv2.getTextSize(text, FONT, scale, thick)
         radius = max(6, int(th * 0.75)) if layers is not None else 0
         w = tw + (2 * radius + pad if radius else 0) + 2 * pad
@@ -63,9 +110,10 @@ def draw_labels(image: np.ndarray, boxes_list, colors: dict, layers=None, show_c
         mid_y = (y1 + y2) // 2
         text_x = x1 + pad
         if radius:
-            draw_layer_number(image, (text_x + radius, mid_y), layers[i], radius)
+            draw_layer_number(image, (text_x + radius, mid_y), layers[i], radius, is_first_pick)
             text_x += 2 * radius + pad
         text_y = mid_y + th // 2
-        color = colors.get(int(b['cls']), (0, 255, 0))
+        color = (grasp_order_color(layers[i], is_first_pick) if layers is not None
+                 else colors.get(int(b['cls']), (0, 255, 0)))
         cv2.putText(image, text, (text_x, text_y), FONT, scale, (255, 255, 255), thick + 2 * outline, cv2.LINE_AA)
         cv2.putText(image, text, (text_x, text_y), FONT, scale, color, thick, cv2.LINE_AA)

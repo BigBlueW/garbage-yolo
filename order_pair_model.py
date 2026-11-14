@@ -11,8 +11,9 @@ import numpy as np
 import torch
 from torch import nn
 
-from grasp_order import compute_layers
-from grasp_sequence import SceneObject, make_acyclic_edges
+from grasp_sequence import (
+    SceneObject, complete_sequence, make_acyclic_edges, uncertain_incoming_risks,
+)
 
 
 PAIR_CLASSES = ("A_before_B", "B_before_A", "no_relation")
@@ -197,34 +198,67 @@ def predict_bidirectional_decision(
 
 
 @torch.no_grad()
-def predict_layers(
+def predict_grasp_plan(
     model: nn.Module,
     image: np.ndarray,
-    boxes: Sequence[tuple[int, np.ndarray]],
+    boxes: Sequence[tuple],
     image_size: int,
     device: torch.device,
     threshold: float = 0.80,
-) -> list[int]:
-    """Grasp layer per detected box: 1 = nothing on top (graspable now), 2 = after layer 1, ...
+) -> tuple[list[int], list[int]]:
+    """Return per-box ``(layer, rank)`` lists in detection order.
 
-    ``boxes`` is ``[(class_id, 4x2 pixel corners), ...]`` in detection order.
+    Each box is ``(class_id, 4x2 pixel corners[, detector_confidence])``.
+    The relation graph determines the layer.  Existing safety and uncertainty
+    tie-breaks determine a unique rank inside each layer, so rank 1 is the
+    authoritative next grasp for the current frame.
     """
-    objects = [SceneObject(i, int(cls), np.asarray(pts, dtype=np.float32)) for i, (cls, pts) in enumerate(boxes)]
+    objects = []
+    for object_id, box in enumerate(boxes):
+        if len(box) not in (2, 3):
+            raise ValueError("Each box must be (class_id, points[, confidence])")
+        cls, pts = box[:2]
+        confidence = float(box[2]) if len(box) == 3 else 1.0
+        objects.append(SceneObject(
+            object_id, int(cls), np.asarray(pts, dtype=np.float32), confidence,
+        ))
     candidates = []
+    uncertain = []
     for a_id in range(len(objects)):
         for b_id in range(a_id + 1, len(objects)):
             decision = predict_bidirectional_decision(
                 model, image, objects[a_id], objects[b_id], image_size, device, threshold,
             )
+            if decision.status == "uncertain":
+                uncertain.append((a_id, b_id, decision.label, decision.confidence))
             if decision.status == "relation" and decision.label is not None:
                 source, target = (a_id, b_id) if decision.label == 0 else (b_id, a_id)
                 candidates.append((source, target, decision.confidence))
     accepted, _ = make_acyclic_edges(len(objects), candidates)
+    risk_by_id = uncertain_incoming_risks(uncertain)
+    ranked, layer_groups = complete_sequence(objects, accepted, image.shape, risk_by_id)
     layer_of = [0] * len(objects)
-    for number, layer in enumerate(compute_layers(len(objects), accepted), start=1):
+    for number, layer in enumerate(layer_groups, start=1):
         for index in layer:
             layer_of[index] = number
-    return layer_of
+    rank_of = [0] * len(objects)
+    for item in ranked:
+        rank_of[item.object_id] = item.rank
+    return layer_of, rank_of
+
+
+@torch.no_grad()
+def predict_layers(
+    model: nn.Module,
+    image: np.ndarray,
+    boxes: Sequence[tuple],
+    image_size: int,
+    device: torch.device,
+    threshold: float = 0.80,
+) -> list[int]:
+    """Backward-compatible layer-only interface."""
+    layers, _ = predict_grasp_plan(model, image, boxes, image_size, device, threshold)
+    return layers
 
 
 def predict_bidirectional_relation(*args, **kwargs) -> tuple[int, float] | None:
