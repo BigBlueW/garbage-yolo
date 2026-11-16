@@ -12,6 +12,7 @@ import torch
 from ultralytics import YOLO
 from label_overlay import draw_labels, grasp_order_color
 from order_pair_model import load_pair_model, predict_grasp_plan
+from surface_grasp import CameraIntrinsics, prepare_scene, refine_grasp
 import argparse
 
 def parse_args():
@@ -204,7 +205,7 @@ class App(ctk.CTk):
         # --- Sidebar Frame ---
         self.sidebar_frame = ctk.CTkFrame(self, width=280, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(14, weight=1)
+        self.sidebar_frame.grid_rowconfigure(15, weight=1)
 
         self.logo_label = ctk.CTkLabel(
             self.sidebar_frame, 
@@ -316,7 +317,16 @@ class App(ctk.CTk):
             command=self.run_inference
         )
         self.conf_switch.select()
-        self.conf_switch.grid(row=10, column=0, padx=20, pady=(5, 15), sticky="w")
+        self.conf_switch.grid(row=10, column=0, padx=20, pady=(5, 10), sticky="w")
+
+        # Top Surface Switch（點雲上表面：綠色半透明＝上表面、綠點＝夾取點、綠線＝閉合方向；需 depth.npy，預設開啟）
+        self.surface_switch = ctk.CTkSwitch(
+            self.sidebar_frame,
+            text="Top Surface",
+            command=self.run_inference
+        )
+        self.surface_switch.select()
+        self.surface_switch.grid(row=11, column=0, padx=20, pady=(5, 15), sticky="w")
 
         self.load_btn = ctk.CTkButton(
             self.sidebar_frame, 
@@ -325,7 +335,7 @@ class App(ctk.CTk):
             height=36,
             font=ctk.CTkFont(size=14, weight="bold")
         )
-        self.load_btn.grid(row=11, column=0, padx=20, pady=(5, 5))
+        self.load_btn.grid(row=12, column=0, padx=20, pady=(5, 5))
 
         self.select_btn = ctk.CTkButton(
             self.sidebar_frame, 
@@ -336,11 +346,11 @@ class App(ctk.CTk):
             hover_color="#326ba3",
             font=ctk.CTkFont(size=14, weight="bold")
         )
-        self.select_btn.grid(row=12, column=0, padx=20, pady=(5, 10))
+        self.select_btn.grid(row=13, column=0, padx=20, pady=(5, 10))
 
         # Legend Box
         self.legend_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        self.legend_frame.grid(row=13, column=0, padx=20, pady=10, sticky="w")
+        self.legend_frame.grid(row=14, column=0, padx=20, pady=10, sticky="w")
         
         legend_items = [
             ("Plastic", "#2ecc71"),
@@ -604,10 +614,17 @@ class App(ctk.CTk):
                 self.order_device,
             )
 
+        # 3d. 點雲上表面（與 rqt「點雲夾取點」同一套 surface_grasp）
+        surfaces = None
+        if self.surface_switch.get() == 1 and self._depth_mm_current is not None and boxes_list:
+            scene = prepare_scene(self._depth_mm_current, CameraIntrinsics(*self._intrinsics()))
+            if scene is not None:
+                surfaces = [refine_grasp(scene, b['pts'])[0] for b in boxes_list]
+
         # 4. Clean & Minimalist Rendering
         img_h, img_w = self.raw_image_bgr.shape[:2]
         annotated = self._draw_boxes(
-            self.raw_image_bgr.copy(), boxes_list, show_grasp, layers, show_conf, ranks,
+            self.raw_image_bgr.copy(), boxes_list, show_grasp, layers, show_conf, ranks, surfaces,
         )
         depth_panel = None
         if (
@@ -615,18 +632,26 @@ class App(ctk.CTk):
             and self.current_depth_jet.shape[:2] == (img_h, img_w)
         ):
             depth_panel = self._draw_boxes(
-                self.current_depth_jet.copy(), boxes_list, show_grasp, layers, show_conf, ranks,
+                self.current_depth_jet.copy(), boxes_list, show_grasp, layers, show_conf, ranks, surfaces,
             )
 
         self.render_panels(annotated, boxes_list, depth_panel)
 
     # --- Hover-to-inspect (continued in App methods below) ---
     def _draw_boxes(self, annotated: np.ndarray, boxes_list, show_grasp: bool, layers=None,
-                    show_conf: bool = True, ranks=None) -> np.ndarray:
-        """在給定圖片上畫 OBB 框 + badge（+Grasp Pose）（+抓取順序數字）；回傳同一張圖。RGB 與 JET 深度共用"""
+                    show_conf: bool = True, ranks=None, surfaces=None) -> np.ndarray:
+        """在給定圖片上畫 OBB 框 + badge（+Grasp Pose）（+抓取順序數字）（+上表面）；回傳同一張圖。RGB 與 JET 深度共用"""
         img_h, img_w = annotated.shape[:2]
 
         line_thick = max(2, int(round(img_w / 450.0)))
+
+        # 上表面半透明綠色（先畫，框線蓋在上面）
+        contours = [np.array(s.contour_px, np.int32) for s in (surfaces or [])
+                    if s is not None and len(s.contour_px) >= 3]
+        if contours:
+            overlay = annotated.copy()
+            cv2.fillPoly(overlay, contours, (0, 220, 0))
+            cv2.addWeighted(overlay, 0.3, annotated, 0.7, 0, dst=annotated)
 
         for i, b in enumerate(boxes_list):
             cls_id = b['cls']
@@ -653,6 +678,16 @@ class App(ctk.CTk):
                 p4 = (int(cx + dx2), int(cy + dy2))
                 cv2.line(annotated, p3, p4, (0, 255, 255), max(2, line_thick), cv2.LINE_AA)
                 cv2.circle(annotated, (int(cx), int(cy)), max(4, line_thick + 2), (0, 0, 255), -1, cv2.LINE_AA)
+
+            # 上表面夾取點（綠點）＋閉合方向（綠線）
+            s = surfaces[i] if surfaces else None
+            if s is not None:
+                (ax, ay), (bx, by) = s.closing_px
+                cv2.line(annotated, (int(ax), int(ay)), (int(bx), int(by)), (0, 220, 0), line_thick, cv2.LINE_AA)
+                gc = (int(s.center_px[0]), int(s.center_px[1]))
+                r = max(5, line_thick + 3)
+                cv2.circle(annotated, gc, r, (0, 220, 0), -1, cv2.LINE_AA)
+                cv2.circle(annotated, gc, r, (0, 0, 0), 1, cv2.LINE_AA)
 
         # 標籤最後畫，才不會被框線蓋住；位置會自動錯開
         draw_labels(annotated, boxes_list, CLASS_COLORS, layers, show_conf, ranks)
